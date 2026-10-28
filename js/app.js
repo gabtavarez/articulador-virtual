@@ -12,26 +12,81 @@ window.__S = S;
 
 /* ---------- cena ---------- */
 const stage = $('stage'), canvas = $('gl');
-let renderer = null, scene, camera, orbit, tc, pivot, upObj = null, loObj = null;
-const baseUp = [0.90, 0.87, 0.80], baseLo = [0.60, 0.71, 0.83];
+let renderer = null, scene, camera, orbit, tc, pivot, upObj = null, loObj = null, matcap = null, triad = null;
+const clipPlanes = [];
+const baseUp = [0.99, 0.95, 0.86], baseLo = [0.70, 0.82, 0.96];
+S.radius = 50; S.bounds = null; S.sect = { on: false, axis: 0, t: 0.5, flip: false };
 let rafPending = false;
+
+/* matcap procedural: luz principal em cima à esquerda, preenchimento frio embaixo, borda clara. Sombreia por normal de tela, então a forma aparece em qualquer ângulo. */
+function makeMatcap() {
+  const n = 256, c = document.createElement('canvas'); c.width = c.height = n;
+  const g = c.getContext('2d');
+  const bg = g.createRadialGradient(n * 0.36, n * 0.30, n * 0.02, n * 0.5, n * 0.5, n * 0.5);
+  bg.addColorStop(0, '#ffffff'); bg.addColorStop(0.30, '#f3f5f6'); bg.addColorStop(0.62, '#d3d9dc'); bg.addColorStop(0.88, '#97a2a8'); bg.addColorStop(1, '#b4bec3');
+  g.fillStyle = bg; g.fillRect(0, 0, n, n);
+  const fl = g.createRadialGradient(n * 0.80, n * 0.86, 0, n * 0.80, n * 0.86, n * 0.40);
+  fl.addColorStop(0, 'rgba(255,255,255,0.30)'); fl.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = fl; g.fillRect(0, 0, n, n);
+  return new THREE.CanvasTexture(c);
+}
+function labelSprite(txt, color) {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d'); g.font = '700 40px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineWidth = 6; g.strokeStyle = 'rgba(0,0,0,0.55)'; g.strokeText(txt, 32, 34); g.fillStyle = color; g.fillText(txt, 32, 34);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, transparent: true }));
+  sp.scale.set(0.62, 0.62, 1); return sp;
+}
+function buildTriad() {
+  const sc = new THREE.Scene(), cam = new THREE.OrthographicCamera(-1.7, 1.7, 1.7, -1.7, 0.1, 20);
+  cam.up.set(0, 0, 1);
+  for (const [name, d, hex, css] of [['X', [1, 0, 0], 0xf0645a, '#f0645a'], ['Y', [0, 1, 0], 0x4fd08f, '#4fd08f'], ['Z', [0, 0, 1], 0x6c9bff, '#6c9bff']]) {
+    const v = new THREE.Vector3(...d);
+    sc.add(new THREE.ArrowHelper(v, new THREE.Vector3(), 1.05, hex, 0.3, 0.17));
+    const l = labelSprite(name, css); l.position.copy(v.multiplyScalar(1.42)); sc.add(l);
+  }
+  triad = { sc, cam };
+}
+function drawTriad(w, h) {
+  if (!triad) return;
+  const size = Math.round(Math.max(56, Math.min(92, Math.min(w, h) * 0.2)));
+  const dir = camera.position.clone().sub(orbit.target).normalize().multiplyScalar(6);
+  triad.cam.position.copy(dir); triad.cam.lookAt(0, 0, 0);
+  const x = w - size - 10, y = 10;
+  renderer.setScissorTest(true); renderer.setViewport(x, y, size, size); renderer.setScissor(x, y, size, size);
+  renderer.autoClear = false; renderer.clearDepth();
+  renderer.render(triad.sc, triad.cam);
+  renderer.setScissorTest(false); renderer.autoClear = true;
+}
+function renderNow() {
+  if (!renderer) return;
+  /* near/far acompanham a distância à cena: sem corte ao dar zoom e sem brigar de profundidade no contato */
+  const d = camera.position.distanceTo(orbit.target), r = Math.max(S.radius, 5);
+  camera.near = Math.max(0.02, d - r * 1.6); camera.far = d + r * 2.5; camera.updateProjectionMatrix();
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setViewport(0, 0, w, h); renderer.setScissorTest(false);
+  renderer.render(scene, camera);
+  drawTriad(w, h);
+}
 function requestRender() {
   if (!renderer || rafPending) return;
   rafPending = true;
-  requestAnimationFrame(() => { rafPending = false; renderer.render(scene, camera); });
+  requestAnimationFrame(() => { rafPending = false; renderNow(); });
 }
 function initScene() {
-  if (typeof THREE === 'undefined') { $('err').textContent = 'Não foi possível carregar a biblioteca 3D. Verifique a conexão e recarregue.'; return false; }
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  if (typeof THREE === 'undefined') { $('err').textContent = 'Não foi possível carregar a biblioteca 3D. Recarregue a página.'; return false; }
+  try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' }); }
+  catch (e) { $('err').textContent = 'Este navegador não conseguiu iniciar o WebGL. Ative a aceleração por hardware e recarregue.'; return false; }
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.localClippingEnabled = true;
   scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(32, 1, 0.5, 4000);
-  camera.up.set(0, 0, 1);
-  camera.position.set(0, -140, 90);
+  camera = new THREE.PerspectiveCamera(30, 1, 0.1, 2000);
+  camera.up.set(0, 0, 1);               // nunca mudar: o OrbitControls guarda este eixo na criação
+  camera.position.set(60, -110, 70);
   scene.add(camera);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x4a5560, 0.85));
-  const dl = new THREE.DirectionalLight(0xffffff, 0.75); dl.position.set(0.4, 0.6, 1); camera.add(dl);
+  matcap = makeMatcap();
   orbit = new THREE.OrbitControls(camera, canvas);
+  orbit.rotateSpeed = 0.9; orbit.screenSpacePanning = true;
   orbit.addEventListener('change', requestRender);
   pivot = new THREE.Group(); scene.add(pivot);
   tc = new THREE.TransformControls(camera, canvas);
@@ -43,6 +98,9 @@ function initScene() {
   });
   tc.addEventListener('objectChange', () => { readPivot(); });
   scene.add(tc);
+  buildTriad();
+  canvas.addEventListener('webglcontextlost', ev => { ev.preventDefault(); window.__status && window.__status('Contexto 3D perdido, restaurando…'); });
+  canvas.addEventListener('webglcontextrestored', () => { window.__status && window.__status(''); requestRender(); });
   const ro = new ResizeObserver(resize); ro.observe(stage); resize();
   return true;
 }
@@ -62,14 +120,17 @@ function colorArray(entry, base, useOrig) {
   }
   return c;
 }
-function makeObj(entry, base) {
+function makeObj(entry, base, isLower) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(entry.work.pos, 3));
   g.setIndex(new THREE.BufferAttribute(entry.mesh.idx, 1));
   g.setAttribute('color', new THREE.BufferAttribute(colorArray(entry, base, $('chkOrig').checked), 3));
   g.computeVertexNormals();
-  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, metalness: 0.02, side: THREE.DoubleSide });
-  return new THREE.Mesh(g, m);
+  const m = new THREE.MeshMatcapMaterial({ matcap, vertexColors: true, side: THREE.DoubleSide, clippingPlanes: clipPlanes });
+  if (isLower) { m.polygonOffset = true; m.polygonOffsetFactor = 1; m.polygonOffsetUnits = 1; }
+  const mesh = new THREE.Mesh(g, m);
+  if (isLower) mesh.renderOrder = 2;
+  return mesh;
 }
 function disposeObj(o) { if (!o) return; o.parent && o.parent.remove(o); o.geometry.dispose(); o.material.dispose(); }
 
@@ -89,7 +150,7 @@ function rebuild(resetPose = true) {
   disposeObj(upObj); disposeObj(loObj); upObj = loObj = null;
   if (S.upper) { upObj = makeObj(S.upper, baseUp); scene.add(upObj); }
   if (S.lower) {
-    loObj = makeObj(S.lower, baseLo);
+    loObj = makeObj(S.lower, baseLo, true);
     const p = S.lower.work.pos, n = S.lower.work.nv, c = [0, 0, 0];
     for (let i = 0; i < n; i++) { c[0] += p[i * 3]; c[1] += p[i * 3 + 1]; c[2] += p[i * 3 + 2]; }
     S.cl = [c[0] / n, c[1] / n, c[2] / n];
@@ -101,7 +162,7 @@ function rebuild(resetPose = true) {
   S.heat = null; S.heatRun++;
   syncPivot();
   attachGizmo();
-  fitView('fit');
+  fitView(S.hasView ? 'fit' : 'iso'); S.hasView = true;
   $('empty').style.display = (S.upper || S.lower) ? 'none' : '';
   window.__afterRebuild && window.__afterRebuild();
 }
@@ -141,7 +202,7 @@ function afterPoseChange() {
   S.heat = null; S.heatRun++;
   updateButtons();
   clearTimeout(heatTimer);
-  heatTimer = setTimeout(() => window.__refreshStats && window.__refreshStats(), 350);
+  heatTimer = setTimeout(() => { refreshBounds(); window.__refreshStats && window.__refreshStats(); }, 350);
 }
 function attachGizmo() {
   if (!tc) return;
@@ -150,31 +211,48 @@ function attachGizmo() {
 }
 
 /* ---------- câmera ---------- */
-function sceneBounds() {
-  const b = new THREE.Box3();
-  if (upObj) b.expandByObject(upObj);
-  if (loObj) { pivot.updateMatrixWorld(true); b.expandByObject(loObj); }
-  return b;
+function refreshBounds() {
+  const bb = new THREE.Box3();
+  if (upObj) bb.expandByObject(upObj);
+  if (loObj) { pivot.updateMatrixWorld(true); bb.expandByObject(loObj); }
+  S.bounds = bb;
+  if (!bb.isEmpty()) S.radius = bb.getSize(new THREE.Vector3()).length() / 2;
+  updateSection();
+  return bb;
 }
+const VIEW_DIRS = { top: [0, -0.02, 1], bottom: [0, -0.02, -1], front: [0, -1, 0], side: [1, 0, 0], iso: [0.55, -0.8, 0.6] };
 function fitView(kind) {
   if (!camera) return;
-  const b = sceneBounds();
-  if (b.isEmpty()) return;
-  const ctr = b.getCenter(new THREE.Vector3()), sz = b.getSize(new THREE.Vector3());
-  const r = Math.max(10, sz.length() / 2), dist = r / Math.tan(camera.fov * Math.PI / 360) * 1.05;
-  let dir;
-  if (kind === 'top') { dir = new THREE.Vector3(0, 0.0001, 1); camera.up.set(0, 1, 0); }
-  else if (kind === 'front') { dir = new THREE.Vector3(0, -1, 0); camera.up.set(0, 0, 1); }
-  else if (kind === 'side') { dir = new THREE.Vector3(1, 0, 0); camera.up.set(0, 0, 1); }
-  else { dir = camera.position.clone().sub(orbit.target); if (dir.lengthSq() < 1e-6) dir.set(0, -1, 0.6); dir.normalize(); if (!S.hasView) { dir.set(0, -0.8, 0.6).normalize(); camera.up.set(0, 0, 1); } S.hasView = true; }
+  const bb = refreshBounds();
+  if (bb.isEmpty()) return;
+  const ctr = bb.getCenter(new THREE.Vector3()), r = Math.max(5, S.radius);
+  const vf = camera.fov * Math.PI / 360, hf = Math.atan(Math.tan(vf) * camera.aspect), ef = Math.min(vf, hf);
+  const dist = r / Math.sin(ef) * 0.9;
+  const dir = kind === 'fit' ? camera.position.clone().sub(orbit.target) : new THREE.Vector3(...(VIEW_DIRS[kind] || VIEW_DIRS.iso));
+  if (dir.lengthSq() < 1e-6) dir.set(...VIEW_DIRS.iso);
+  dir.normalize();
+  orbit.target.copy(ctr);
   camera.position.copy(ctr).addScaledVector(dir, dist);
-  camera.near = Math.max(0.1, dist / 200); camera.far = dist * 20; camera.updateProjectionMatrix();
-  orbit.target.copy(ctr); orbit.update(); requestRender();
+  orbit.minDistance = r * 0.12; orbit.maxDistance = dist * 6;
+  camera.lookAt(ctr); orbit.update(); requestRender();
 }
+
+/* ---------- plano de corte ---------- */
+function updateSection() {
+  clipPlanes.length = 0;
+  const sc = S.sect;
+  if (sc.on && S.bounds && !S.bounds.isEmpty()) {
+    const mn = S.bounds.min.getComponent(sc.axis), mx = S.bounds.max.getComponent(sc.axis), pos = mn + (mx - mn) * sc.t;
+    const n = new THREE.Vector3(); n.setComponent(sc.axis, sc.flip ? 1 : -1);
+    clipPlanes.push(new THREE.Plane(n, sc.flip ? -pos : pos));
+  }
+  requestRender();
+}
+function setSection(patch) { Object.assign(S.sect, patch); updateSection(); }
 
 function updateButtons() { window.__updateButtons && window.__updateButtons(); }
 
-window.__A = { $, tick, T3, S, initScene, rebuild, setPose, undo, isIdentity, syncPivot, attachGizmo, fitView, applyGhost, requestRender,
+window.__A = { $, tick, T3, S, initScene, rebuild, setPose, undo, isIdentity, syncPivot, attachGizmo, fitView, applyGhost, requestRender, setSection, refreshBounds,
   bboxCenter, colorArray, getObj: () => ({ upObj, loObj }), getTC: () => tc, pushUndo, afterPoseChange, baseUp, baseLo };
 })();
 
@@ -585,6 +663,21 @@ async function exportZip() {
 /* ---------- início ---------- */
 function init() {
   B.wire(); window.__C.wire();
+  const root = document.documentElement;
+  $('btnTheme').addEventListener('click', () => {
+    const cur = root.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('av-theme', next); } catch (e) { }
+    const m = document.querySelector('meta[name="theme-color"]'); if (m) m.content = next === 'dark' ? '#11171c' : '#f5f8f9';
+  });
+  const bar = document.querySelector('.bar');
+  const setBarH = () => root.style.setProperty('--bar-h', bar.offsetHeight + 'px');
+  new ResizeObserver(setBarH).observe(bar); setBarH();
+  $('chkSect').addEventListener('change', e => { $('sectBody').hidden = !e.target.checked; A.setSection({ on: e.target.checked }); });
+  $('selSectAxis').addEventListener('change', e => { $('rngSect').value = 500; A.setSection({ axis: +e.target.value, t: 0.5 }); });
+  $('rngSect').addEventListener('input', e => A.setSection({ t: e.target.value / 1000 }));
+  $('btnSectFlip').addEventListener('click', () => A.setSection({ flip: !S.sect.flip }));
   $('vNorm').addEventListener('click', () => setHeat(false));
   $('vHeat').addEventListener('click', () => setHeat(true));
   $('btnZip').addEventListener('click', exportZip);
