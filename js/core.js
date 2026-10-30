@@ -606,70 +606,80 @@ const GEO = (() => {
 })();
 if (typeof module !== "undefined") module.exports = GEO;
 
-/* ===== OPT: otimização da oclusão estática (lower se move, upper fixo) ===== */
+/* ===== OPT v2: oclusão estática com custo robusto (Geman-McClure) + penetração, recozimento em σ ===== */
 const OPT = (() => {
   const G = typeof GEO !== "undefined" ? GEO : require("./core_geom.js");
   const tick = () => new Promise(r => setTimeout(r, 0));
 
+  /* amostra de vértices: posições e pseudo-normais (a normal serve para ignorar superfícies que não se encaram) */
   function sampleVerts(m, n) {
     const step = Math.max(1, Math.floor(m.nv / n)), cnt = Math.floor(m.nv / step);
-    const o = new Float32Array(cnt * 3);
-    for (let i = 0; i < cnt; i++) { const j = i * step * 3; o[i * 3] = m.pos[j]; o[i * 3 + 1] = m.pos[j + 1]; o[i * 3 + 2] = m.pos[j + 2]; }
+    const o = new Float32Array(cnt * 3), nr = new Float32Array(cnt * 3);
+    for (let i = 0; i < cnt; i++) {
+      const j = i * step * 3;
+      o[i * 3] = m.pos[j]; o[i * 3 + 1] = m.pos[j + 1]; o[i * 3 + 2] = m.pos[j + 2];
+      nr[i * 3] = m.vn[j]; nr[i * 3 + 1] = m.vn[j + 1]; nr[i * 3 + 2] = m.vn[j + 2];
+    }
+    o.nr = nr;
     return o;
   }
 
-  /* Soma custo (e, se wantJ, sistema normal 6x6) para a pose M do lower. */
+  /* Custo e (opcionalmente) sistema normal 6x6 para a pose M do lower (upper fixo).
+     d >= 0: Geman-McClure  s2*d^2/(d^2+s2)  (satura, mas tem bacia larga quando sigma é grande)
+     d <  0: wp*d^2        (penetração nunca satura dentro de maxR) */
   function evaluate(M, ctx, P, wantJ) {
     const { up, lo, Ls, Us } = ctx;
     const res = { d: 0, tri: 0, qx: 0, qy: 0, qz: 0 };
     const A = wantJ ? new Float64Array(36) : null, b = wantJ ? new Float64Array(6) : null;
-    const J = new Float64Array(6), tmp = [0, 0, 0], tmp2 = [0, 0, 0];
-    let cost = 0, nPen = 0, nCon = 0, minD = Infinity, maxPen = 0;
-    const missCost = P.wg * P.gapMax * P.gapMax;
+    const J = new Float64Array(6), tmp = [0, 0, 0], tmp2 = [0, 0, 0], nn = [0, 0, 0];
+    const s2 = P.sigma * P.sigma, s4 = s2 * s2;
+    let cost = 0, nPen = 0, nCon = 0, nNear = 0, maxPen = 0;
     const add = (w, r) => {
-      if (!wantJ) return;
       for (let i = 0; i < 6; i++) {
         b[i] += w * J[i] * r;
         for (let j = i; j < 6; j++) A[i * 6 + j] += w * J[i] * J[j];
       }
     };
-    const nL = Ls.length / 3, nU = Us.length / 3;
+    /* d<0: penetração (sempre vale). d>=0: só conta quanto as superfícies se encaram (normais opostas) */
+    const handle = (d, dotN) => {
+      if (d < 0) { cost += P.wp * d * d; nPen++; if (-d > maxPen) maxPen = -d; return P.wp; }
+      const f = Math.max(0, Math.min(1, -dotN / 0.6));
+      const q = d * d + s2;
+      cost += f * s2 * d * d / q + (1 - f) * s2;
+      if (f > 0.5) { if (d < 0.15) nCon++; if (d < 1) nNear++; }
+      return f * s4 / (q * q);
+    };
+    const nL = Ls.length / 3, nU = Us.length / 3, nrL = Ls.nr, nrU = Us.nr;
     for (let i = 0; i < nL; i++) {
       G.applyPt(M, Ls[i * 3], Ls[i * 3 + 1], Ls[i * 3 + 2], tmp);
-      if (!G.closest(up, tmp[0], tmp[1], tmp[2], P.maxR, res)) { cost += missCost; continue; }
-      const d = res.d;
-      if (d < 0) {
-        cost += P.wp * d * d; nPen++; if (-d > maxPen) maxPen = -d;
-      } else if (d < P.gapMax) { cost += P.wg * d * d; if (d < 0.15) nCon++; }
-      else { cost += missCost; continue; }
-      if (d < minD) minD = d;
-      if (wantJ) {
-        const nx = up.fn[res.tri * 3], ny = up.fn[res.tri * 3 + 1], nz = up.fn[res.tri * 3 + 2];
+      if (!G.closest(up, tmp[0], tmp[1], tmp[2], P.maxR, res)) { cost += s2; continue; }
+      G.applyDir(M, nrL[i * 3], nrL[i * 3 + 1], nrL[i * 3 + 2], nn);
+      const t3 = res.tri * 3, dotN = nn[0] * up.fn[t3] + nn[1] * up.fn[t3 + 1] + nn[2] * up.fn[t3 + 2];
+      const d = res.d, w = handle(d, dotN);
+      if (wantJ && w > 0) {
+        const nx = up.fn[t3], ny = up.fn[t3 + 1], nz = up.fn[t3 + 2];
         J[0] = tmp[1] * nz - tmp[2] * ny; J[1] = tmp[2] * nx - tmp[0] * nz; J[2] = tmp[0] * ny - tmp[1] * nx;
         J[3] = nx; J[4] = ny; J[5] = nz;
-        add(d < 0 ? P.wp : P.wg, d);
+        add(w, d);
       }
     }
     const Minv = G.invRigid(M);
     for (let i = 0; i < nU; i++) {
-      const ux = Us[i * 3], uy = Us[i * 3 + 1], uz = Us[i * 3 + 2];
-      G.applyPt(Minv, ux, uy, uz, tmp);
-      if (!G.closest(lo, tmp[0], tmp[1], tmp[2], P.maxR, res)) { cost += missCost; continue; }
-      const d = res.d;
-      if (d < 0) { cost += P.wp * d * d; nPen++; if (-d > maxPen) maxPen = -d; }
-      else if (d < P.gapMax) { cost += P.wg * d * d; if (d < 0.15) nCon++; }
-      else { cost += missCost; continue; }
-      if (d < minD) minD = d;
-      if (wantJ) {
+      G.applyPt(Minv, Us[i * 3], Us[i * 3 + 1], Us[i * 3 + 2], tmp);
+      if (!G.closest(lo, tmp[0], tmp[1], tmp[2], P.maxR, res)) { cost += s2; continue; }
+      G.applyDir(Minv, nrU[i * 3], nrU[i * 3 + 1], nrU[i * 3 + 2], nn);
+      const t3 = res.tri * 3, dotN = nn[0] * lo.fn[t3] + nn[1] * lo.fn[t3 + 1] + nn[2] * lo.fn[t3 + 2];
+      const d = res.d, w = handle(d, dotN);
+      if (wantJ && w > 0) {
         G.applyPt(M, res.qx, res.qy, res.qz, tmp2);
-        G.applyDir(M, lo.fn[res.tri * 3], lo.fn[res.tri * 3 + 1], lo.fn[res.tri * 3 + 2], tmp);
+        G.applyDir(M, lo.fn[t3], lo.fn[t3 + 1], lo.fn[t3 + 2], tmp);
         J[0] = -(tmp2[1] * tmp[2] - tmp2[2] * tmp[1]); J[1] = -(tmp2[2] * tmp[0] - tmp2[0] * tmp[2]); J[2] = -(tmp2[0] * tmp[1] - tmp2[1] * tmp[0]);
         J[3] = -tmp[0]; J[4] = -tmp[1]; J[5] = -tmp[2];
-        add(d < 0 ? P.wp : P.wg, d);
+        add(w, d);
       }
     }
     if (wantJ) for (let i = 0; i < 6; i++) for (let j = 0; j < i; j++) A[i * 6 + j] = A[j * 6 + i];
-    return { cost: cost / (nL + nU), A, b, nPen, nCon, maxPen, minD };
+    return { cost: cost / (nL + nU), A, b, nPen, nCon, nNear, maxPen, n: nL + nU };
   }
 
   function solve6(A, b, lambda) {
@@ -706,7 +716,6 @@ const OPT = (() => {
     return G.mat4Mul(G.mat4FromRT(G.rodrigues(wx, wy, wz), [tx, ty, tz]), M);
   }
 
-  /* LM; retorna {M, cost, stats} */
   async function refine(M, ctx, P, iters, opt = {}) {
     let cur = evaluate(M, ctx, P, true), lambda = 0.05, stall = 0;
     for (let it = 0; it < iters; it++) {
@@ -720,22 +729,41 @@ const OPT = (() => {
         if (c2.cost < cur.cost) {
           const gain = (cur.cost - c2.cost) / (cur.cost + 1e-9);
           M = M2; cur = evaluate(M, ctx, P, true); lambda = Math.max(1e-4, lambda * 0.4); ok = true;
-          stall = gain < 2e-4 ? stall + 1 : 0;
+          stall = gain < 1e-4 ? stall + 1 : 0;
           break;
         }
         lambda *= 4;
       }
-      if (opt.onIter) opt.onIter(it, cur);
       if (!ok || stall >= 3) break;
-      if (opt.yield !== false && it % 2 === 1) await tick();
+      if (opt.yield !== false && it % 3 === 2) await tick();
     }
     return { M, cost: cur.cost, stats: cur };
   }
 
+  /* recozimento: sigma e raio de busca diminuem, penetração pesa cada vez mais */
+  const COARSE = [
+    { sigma: 2, maxR: 8, wp: 10, iters: 12, maxTr: 1.0, maxRot: 0.06 },
+    { sigma: 1, maxR: 5, wp: 15, iters: 12, maxTr: 0.6, maxRot: 0.04 },
+    { sigma: 0.5, maxR: 3, wp: 20, iters: 12, maxTr: 0.3, maxRot: 0.02 },
+  ];
+  const FINE = [
+    { sigma: 0.5, maxR: 3, wp: 20, iters: 20, maxTr: 0.25, maxRot: 0.02 },
+    { sigma: 0.25, maxR: 2, wp: 30, iters: 25, maxTr: 0.12, maxRot: 0.01 },
+  ];
+  const SCORE = { sigma: 0.5, maxR: 3, wp: 20 };
+
+  async function anneal(M, ctx, stages, opt = {}) {
+    for (const st of stages) {
+      const r = await refine(M, ctx, st, st.iters, { maxTr: st.maxTr, maxRot: st.maxRot, cancel: opt.cancel, yield: opt.yield });
+      M = r.M;
+    }
+    return M;
+  }
+
   const SIGNS = [[1, 1, 1], [-1, -1, 1], [-1, 1, -1], [1, -1, -1]];
 
-  /* Poses iniciais: PCA do upper/lower, 4 giros proprios x 2 sentidos de fechamento */
-  function candidates(up, lo) {
+  /* Poses iniciais por PCA: 4 giros próprios x 2 sentidos de fechamento (o PCA erra por ~20° em arcos assimétricos; o recozimento corrige) */
+  function pcaCandidates(up, lo, raw) {
     const pu = G.pca(up.pos, Math.max(1, Math.floor(up.nv / 20000))), pl = G.pca(lo.pos, Math.max(1, Math.floor(lo.nv / 20000)));
     const out = [];
     for (const S of SIGNS) {
@@ -759,45 +787,142 @@ const OPT = (() => {
           if (v < minL) minL = v;
         }
         const sh = Eu - 0.5 - minL;
-        const M = G.mat4Mul(G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], [s[0] * sh, s[1] * sh, s[2] * sh]), M0);
-        out.push(M);
+        if (raw) out.push({ M0, s, c: pu.c, Eu });
+        else out.push(G.mat4Mul(G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], [s[0] * sh, s[1] * sh, s[2] * sh]), M0));
       }
     }
     return out;
   }
 
-  /* Pipeline completo. up, lo: malhas preparadas (com grade). Retorna {M, stats, tried} */
-  async function autoOcclusion(up, lo, opt = {}) {
-    const rep = opt.onProgress || (() => { });
-    const APPROACH = { maxR: 4, gapMax: 3, wg: 0.5, wp: 1 };
-    const FINE = { maxR: 3, gapMax: 1.2, wg: 0.15, wp: 1.5 };
-    const ctxS = { up, lo, Ls: sampleVerts(lo, 500), Us: sampleVerts(up, 500) };
-    const cands = opt.starts || candidates(up, lo);
-    const scored = [];
-    for (let i = 0; i < cands.length; i++) {
-      if (opt.cancel && opt.cancel()) throw new Error("cancelado");
-      rep(`Testando orientação ${i + 1} de ${cands.length}`, (i / cands.length) * 0.5);
-      let r = await refine(cands[i], ctxS, APPROACH, 12, { yield: true, cancel: opt.cancel, maxTr: 1.2, maxRot: 0.1 });
-      r = await refine(r.M, ctxS, FINE, 6, { yield: true, cancel: opt.cancel });
-      scored.push(r);
-      await tick();
+  /* Busca global sem gradiente: para cada pose PCA varia o giro em torno do eixo de fechamento (±30°),
+     afasta o lower, fecha até tocar o upper (bisseção) e ranqueia por distância de Chamfer. */
+  function globalCandidates(up, lo, keep = 6) {
+    const raw = pcaCandidates(up, lo, true), res = { d: 0, tri: 0, qx: 0, qy: 0, qz: 0 };
+    const Ls = sampleVerts(lo, 260), Us = sampleVerts(up, 260), nL = Ls.length / 3, nU = Us.length / 3, t = [0, 0, 0];
+    const I3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    const Tr = v => G.mat4FromRT(I3, v);
+    const minSigned = M => {
+      let m = Infinity;
+      for (let i = 0; i < nL; i++) {
+        G.applyPt(M, Ls[i * 3], Ls[i * 3 + 1], Ls[i * 3 + 2], t);
+        if (G.closest(up, t[0], t[1], t[2], 80, res) && res.d < m) m = res.d;
+      }
+      return m;
+    };
+    const chamfer = M => {
+      let c = 0; const Minv = G.invRigid(M);
+      for (let i = 0; i < nL; i++) {
+        G.applyPt(M, Ls[i * 3], Ls[i * 3 + 1], Ls[i * 3 + 2], t);
+        c += G.closest(up, t[0], t[1], t[2], 6, res) ? Math.min(Math.abs(res.d), 6) ** 2 : 36;
+      }
+      for (let i = 0; i < nU; i++) {
+        G.applyPt(Minv, Us[i * 3], Us[i * 3 + 1], Us[i * 3 + 2], t);
+        c += G.closest(lo, t[0], t[1], t[2], 6, res) ? Math.min(Math.abs(res.d), 6) ** 2 : 36;
+      }
+      return c / (nL + nU);
+    };
+    const out = [];
+    for (const r of raw) {
+      for (const yaw of [-30, -15, 0, 15, 30]) {
+        const Rz = G.rodrigues(r.s[0] * yaw * Math.PI / 180, r.s[1] * yaw * Math.PI / 180, r.s[2] * yaw * Math.PI / 180);
+        const Mr = G.mat4Mul(Tr(r.c), G.mat4Mul(G.mat4FromRT(Rz, [0, 0, 0]), G.mat4Mul(Tr([-r.c[0], -r.c[1], -r.c[2]]), r.M0)));
+        let minL = Infinity;
+        for (let i = 0; i < lo.nv; i += 3) {
+          G.applyPt(Mr, lo.pos[i * 3], lo.pos[i * 3 + 1], lo.pos[i * 3 + 2], t);
+          const v = t[0] * r.s[0] + t[1] * r.s[1] + t[2] * r.s[2];
+          if (v < minL) minL = v;
+        }
+        const at = h => G.mat4Mul(Tr([r.s[0] * (r.Eu + 2 - minL - h), r.s[1] * (r.Eu + 2 - minL - h), r.s[2] * (r.Eu + 2 - minL - h)]), Mr);
+        let a = 0, b = 60;
+        for (let k = 0; k < 14; k++) { const m = (a + b) / 2; if (minSigned(at(m)) < -0.2) b = m; else a = m; }
+        const M = at(a + 0.2);
+        out.push({ M, cost: chamfer(M) });
+      }
     }
-    scored.sort((a, b) => a.cost - b.cost);
-    const ctxF = { up, lo, Ls: sampleVerts(lo, 3000), Us: sampleVerts(up, 3000) };
-    let best = null;
-    const top = scored.slice(0, 2);
-    for (let i = 0; i < top.length; i++) {
-      rep(`Refinando encaixe ${i + 1} de ${top.length}`, 0.5 + (i / top.length) * 0.5);
-      let r = await refine(top[i].M, ctxF, FINE, 40, { yield: true, cancel: opt.cancel, maxTr: 0.4, maxRot: 0.03 });
-      const sharp = { maxR: 3, gapMax: 0.8, wg: 0.1, wp: 3 };
-      r = await refine(r.M, ctxF, sharp, 25, { yield: true, cancel: opt.cancel, maxTr: 0.2, maxRot: 0.015 });
-      if (!best || r.cost < best.cost) best = r;
-    }
-    rep("Concluído", 1);
-    return { M: best.M, cost: best.cost, stats: best.stats, scored: scored.map(s => s.cost) };
+    out.sort((x, y) => x.cost - y.cost);
+    return distinct(out, keep, 2, 6).map(o => o.M);
   }
 
-  /* Distância assinada de cada vértice de `a` (pose Ma) até `b` (pose identidade em seu quadro) */
+  /* Vizinhança da pose atual: os arquivos costumam sair do scanner já perto da mordida; perturbações pequenas cobrem erros de poucos mm/graus */
+  function localCandidates(M, center) {
+    const out = [], Rm = (ax, deg) => { const w = [0, 0, 0]; w[ax] = deg * Math.PI / 180; return G.mat4FromRT(G.rodrigues(w[0], w[1], w[2]), [0, 0, 0]); };
+    const T = (ax, mm) => { const t = [0, 0, 0]; t[ax] = mm; return G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], t); };
+    const c = center || [0, 0, 0], toC = G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], c), fromC = G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], [-c[0], -c[1], -c[2]]);
+    for (let ax = 0; ax < 3; ax++) for (const s of [-1, 1]) {
+      out.push(G.mat4Mul(T(ax, s * 3), M));
+      out.push(G.mat4Mul(toC, G.mat4Mul(Rm(ax, s * 6), G.mat4Mul(fromC, M))));
+    }
+    return out;
+  }
+
+  function poseDiff(A, B) { // distância entre poses: translação (mm) e ângulo (graus) de A^-1 B
+    const E = G.mat4Mul(G.invRigid(A), B);
+    const t = Math.hypot(E[12], E[13], E[14]), a = Math.acos(Math.max(-1, Math.min(1, (E[0] + E[5] + E[10] - 1) / 2))) * 180 / Math.PI;
+    return { t, a };
+  }
+
+  function distinct(list, max, tT = 1.5, tA = 3) {
+    const picks = [];
+    for (const c of list) {
+      if (picks.every(p => { const d = poseDiff(p.M, c.M); return d.t > tT || d.a > tA; })) picks.push(c);
+      if (picks.length >= max) break;
+    }
+    return picks;
+  }
+
+  /* busca em 4 etapas: (1) triagem rápida de ~21 poses iniciais, (2) recozimento das melhores,
+     (3) "saltos" em torno da melhor (cobre erros de PCA de ~15°), (4) refinamento fino dos 3 melhores */
+  async function autoOcclusion(up, lo, opt = {}) {
+    const rep = opt.onProgress || (() => { }), cancel = opt.cancel;
+    const check = () => { if (cancel && cancel()) throw new Error("cancelado"); };
+    const start = opt.start || G.mat4Identity();
+    const ctxS = { up, lo, Ls: sampleVerts(lo, 450), Us: sampleVerts(up, 450) };
+    const ctxF = { up, lo, Ls: sampleVerts(lo, 3500), Us: sampleVerts(up, 3500) };
+    const ctxK = { up, lo, Ls: sampleVerts(lo, 6000), Us: sampleVerts(up, 6000) };
+    const score = M => evaluate(M, ctxS, SCORE, false).cost;
+
+    const pool = [start, ...localCandidates(start, opt.center), ...globalCandidates(up, lo, 6)];
+    let cur = [];
+    for (let i = 0; i < pool.length; i++) {
+      check(); rep(`Triagem ${i + 1} de ${pool.length}`, 0.02 + 0.2 * i / pool.length);
+      const M = await anneal(pool[i], ctxS, COARSE.slice(0, 1), { cancel, yield: true });
+      cur.push({ M, cost: score(M) });
+      await tick();
+    }
+    cur.sort((a, b) => a.cost - b.cost);
+    cur = distinct(cur, 8, 1.0, 2);
+    for (let i = 0; i < cur.length; i++) {
+      check(); rep(`Recozimento ${i + 1} de ${cur.length}`, 0.22 + 0.2 * i / cur.length);
+      cur[i].M = await anneal(cur[i].M, ctxS, COARSE.slice(1), { cancel, yield: true });
+      cur[i].cost = score(cur[i].M);
+    }
+    cur.sort((a, b) => a.cost - b.cost);
+
+    for (let round = 0; round < 2; round++) {
+      const hops = localCandidates(cur[0].M, opt.center);
+      for (let i = 0; i < hops.length; i++) {
+        check(); rep(`Salto ${round + 1}: ${i + 1} de ${hops.length}`, 0.42 + 0.3 * (round * hops.length + i) / (2 * hops.length));
+        const M = await anneal(hops[i], ctxS, COARSE, { cancel, yield: true });
+        cur.push({ M, cost: score(M) });
+        await tick();
+      }
+      cur.sort((a, b) => a.cost - b.cost);
+      cur = distinct(cur, 6, 1.0, 2);
+    }
+
+    const picks = distinct(cur, 3, 1.5, 3), finals = [];
+    for (let i = 0; i < picks.length; i++) {
+      check(); rep(`Refinando encaixe ${i + 1} de ${picks.length}`, 0.74 + 0.25 * i / picks.length);
+      const M = await anneal(picks[i].M, ctxF, FINE, { cancel, yield: true });
+      const st = evaluate(M, ctxK, SCORE, false);
+      finals.push({ M, cost: st.cost, stats: st });
+    }
+    finals.sort((a, b) => a.cost - b.cost);
+    rep("Concluído", 1);
+    const best = finals[0];
+    return { M: best.M, cost: best.cost, stats: best.stats, alternatives: finals };
+  }
+
   function vertexDistances(src, M, dst, maxR, from, to, out) {
     const res = { d: 0 }, t = [0, 0, 0];
     for (let i = from; i < to; i++) {
@@ -806,6 +931,6 @@ const OPT = (() => {
     }
   }
 
-  return { evaluate, refine, candidates, autoOcclusion, vertexDistances, sampleVerts };
+  return { vertexDistances, globalCandidates, evaluate, refine, anneal, pcaCandidates, localCandidates, autoOcclusion, poseDiff, sampleVerts, SCORE };
 })();
 if (typeof module !== "undefined") module.exports = OPT;

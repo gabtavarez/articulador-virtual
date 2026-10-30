@@ -479,16 +479,15 @@ async function runAuto() {
   try {
     await tick();
     await ensureBVH(S.upper); await ensureBVH(S.lower);
-    const starts = [Float64Array.from(S.M), ...OPT.candidates(S.upper.work, S.lower.work)];
     const t0 = performance.now();
-    const r = await OPT.autoOcclusion(S.upper.work, S.lower.work, { starts, cancel: () => S.cancel, onProgress: progress });
-    A.setPose(r.M);
+    const r = await OPT.autoOcclusion(S.upper.work, S.lower.work, { start: Float64Array.from(S.M), center: [0, 0, 0], cancel: () => S.cancel, onProgress: progress });
+    S.alts = r.alternatives; A.setPose(r.M);
     $('pmsg').textContent = 'Concluído em ' + ((performance.now() - t0) / 1000).toFixed(1).replace('.', ',') + ' s. Confira o mapa de contatos e ajuste no modo manual se precisar.';
     $('bar').style.width = '100%';
     if (!S.heatOn) window.__setHeat && window.__setHeat(true);
   } catch (e) {
     $('pmsg').textContent = '';
-    if (!/cancelado/.test(e.message)) B.err('Falha na busca de oclusão: ' + e.message);
+    console.error(e.stack); if (!/cancelado/.test(e.message)) B.err('Falha na busca de oclusão: ' + e.message);
     else $('pmsg').textContent = 'Busca cancelada.';
   } finally {
     S.busy = false; $('btnCancel').hidden = true; setTimeout(() => $('barWrap').classList.remove('on'), 800);
