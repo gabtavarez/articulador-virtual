@@ -142,11 +142,11 @@ function bboxCenter(mesh) {
 
 /* reconstrói tudo que depende das malhas (centro de trabalho, geometria, pose) */
 function rebuild(resetPose = true) {
-  if (!renderer) return;
   const ref = S.upper || S.lower;
   if (!ref) return;
   S.center = bboxCenter(ref.mesh).c;
   for (const e of [S.upper, S.lower]) if (e) { e.work = GEO.prepare(e.mesh, S.center); e.bvh = false; e.area = null; }
+  if (!renderer) return;
   disposeObj(upObj); disposeObj(loObj); upObj = loObj = null;
   if (S.upper) { upObj = makeObj(S.upper, baseUp); scene.add(upObj); }
   if (S.lower) {
@@ -471,6 +471,26 @@ function buildNudge() {
 function progress(msg, f) {
   $('barWrap').classList.add('on'); $('bar').style.width = Math.round(f * 100) + '%'; $('pmsg').textContent = msg;
 }
+function showAlts(r) {
+  const box = $('alts'), L = r.alternatives.filter((x, i) => i === 0 || x.key - r.alternatives[0].key < 0.003);
+  S.alts = L;
+  if (L.length < 2 && !r.ambiguous) { box.hidden = true; return; }
+  const f = x => x.toFixed(1).replace('.', ',');
+  let h = '';
+  if (r.ambiguous) h += '<p class="alt-warn">Há mais de um encaixe plausível (sem registro de mordida isso é normal). Compare abaixo e escolha o que fecha melhor.</p>';
+  h += '<div class="alt-list">';
+  L.forEach((x, i) => {
+    const d = OPT.poseDiff(L[0].M, x.M);
+    const tag = i === 0 ? 'Melhor' : 'Alternativa ' + i;
+    h += `<button type="button" class="alt" data-i="${i}" aria-pressed="${i === 0}"><b>${tag}</b><span>${i === 0 ? 'escolhida' : f(d.t) + ' mm · ' + f(d.a) + '°'}</span><span>pen. ${(x.stats.maxPen).toFixed(2).replace('.', ',')} mm</span></button>`;
+  });
+  box.innerHTML = h + '</div>'; box.hidden = false;
+  box.querySelectorAll('.alt').forEach(btn => btn.addEventListener('click', () => {
+    box.querySelectorAll('.alt').forEach(b => b.setAttribute('aria-pressed', 'false'));
+    btn.setAttribute('aria-pressed', 'true');
+    A.setPose(S.alts[+btn.dataset.i].M);
+  }));
+}
 async function runAuto() {
   if (S.busy || !S.upper || !S.lower) return;
   S.busy = true; S.cancel = false; B.err('');
@@ -478,18 +498,29 @@ async function runAuto() {
   progress('Preparando malhas…', 0.02);
   try {
     await tick();
+    if (!S.upper.work || !S.lower.work) A.rebuild(false);
     await ensureBVH(S.upper); await ensureBVH(S.lower);
     const t0 = performance.now();
-    const r = await OPT.autoOcclusion(S.upper.work, S.lower.work, { start: Float64Array.from(S.M), center: [0, 0, 0], cancel: () => S.cancel, onProgress: progress });
-    S.alts = r.alternatives; A.setPose(r.M);
+    A.setPose(S.M);                                   // guarda a posição original no "Desfazer"
+    $('alts').hidden = true; $('alts').innerHTML = '';
+    if (S.heatOn) window.__setHeat && window.__setHeat(false);
+    document.body.classList.add('searching');
+    const r = await OPT.autoOcclusion(S.upper.work, S.lower.work, {
+      start: Float64Array.from(S.M), center: [0, 0, 0], cancel: () => S.cancel, onProgress: progress,
+      onPose: M => A.setPose(M, { push: false })      // anima o lower procurando a mordida
+    });
+    S.alts = r.alternatives;
+    A.setPose(r.M, { push: false });
+    showAlts(r);
     $('pmsg').textContent = 'Concluído em ' + ((performance.now() - t0) / 1000).toFixed(1).replace('.', ',') + ' s. Confira o mapa de contatos e ajuste no modo manual se precisar.';
     $('bar').style.width = '100%';
     if (!S.heatOn) window.__setHeat && window.__setHeat(true);
   } catch (e) {
     $('pmsg').textContent = '';
     console.error(e.stack); if (!/cancelado/.test(e.message)) B.err('Falha na busca de oclusão: ' + e.message);
-    else $('pmsg').textContent = 'Busca cancelada.';
+    else { $('pmsg').textContent = 'Busca cancelada.'; A.undo(); }
   } finally {
+    document.body.classList.remove('searching');
     S.busy = false; $('btnCancel').hidden = true; setTimeout(() => $('barWrap').classList.remove('on'), 800);
     window.__updateButtons();
   }

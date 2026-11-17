@@ -157,3 +157,12 @@ select { background: var(--panel-2); border: 1px solid var(--line-2); border-rad
   .status { top: auto; bottom: 96px; }
 }
 @media (prefers-reduced-motion: reduce) { .bar-wrap i, .card summary::after { transition: none; } }
+
+.alts { margin-top: 10px; }
+.alt-warn { margin: 0 0 8px; font-size: 12px; color: var(--signal); }
+.alt-list { display: grid; gap: 6px; }
+.alt { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; text-align: left; border: 1px solid var(--line-2); background: var(--panel-2); border-radius: 5px; padding: 7px 10px; font-size: 12px; }
+.alt span { color: var(--muted); font-family: var(--f-mono); }
+.alt[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.alt:hover { border-color: var(--accent); }
+body.searching #bar { transition: none; }

@@ -93,13 +93,14 @@
             <button type="button" id="mMan" aria-pressed="false">Manual</button>
           </div>
           <div id="pAuto">
-            <p class="hint">Parte da posição atual e busca o melhor encaixe, sem penetração; se os arcos estiverem longe, testa várias orientações. Leva ~30 s. O upper fica fixo.</p>
+            <p class="hint">Parte da posição atual e busca o melhor encaixe, sem penetração; se os arcos estiverem longe, testa várias orientações. Você vê o lower procurando a mordida. Leva ~30 s. O upper fica fixo.</p>
             <div class="row">
               <button type="button" class="btn primary" id="btnAuto" disabled>Encontrar oclusão</button>
               <button type="button" class="btn" id="btnCancel" hidden>Cancelar</button>
             </div>
             <div class="bar-wrap" id="barWrap"><i id="bar"></i></div>
             <div class="progress-msg" id="pmsg"></div>
+            <div class="alts" id="alts" hidden></div>
           </div>
           <div id="pMan" hidden>
             <div class="row">

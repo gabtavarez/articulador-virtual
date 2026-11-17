@@ -610,6 +610,7 @@ if (typeof module !== "undefined") module.exports = GEO;
 const OPT = (() => {
   const G = typeof GEO !== "undefined" ? GEO : require("./core_geom.js");
   const tick = () => new Promise(r => setTimeout(r, 0));
+  const frame = () => new Promise(r => (typeof requestAnimationFrame === "function" ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
 
   /* amostra de vértices: posições e pseudo-normais (a normal serve para ignorar superfícies que não se encaram) */
   function sampleVerts(m, n) {
@@ -717,7 +718,7 @@ const OPT = (() => {
   }
 
   async function refine(M, ctx, P, iters, opt = {}) {
-    let cur = evaluate(M, ctx, P, true), lambda = 0.05, stall = 0;
+    let cur = evaluate(M, ctx, P, true), lambda = 0.05, stall = 0, lastFrame = 0, gap = 40;
     for (let it = 0; it < iters; it++) {
       if (opt.cancel && opt.cancel()) break;
       let ok = false;
@@ -730,12 +731,13 @@ const OPT = (() => {
           const gain = (cur.cost - c2.cost) / (cur.cost + 1e-9);
           M = M2; cur = evaluate(M, ctx, P, true); lambda = Math.max(1e-4, lambda * 0.4); ok = true;
           stall = gain < 1e-4 ? stall + 1 : 0;
+          if (opt.onPose) { opt.onPose(M); const now = Date.now(); if (now - lastFrame > gap) { await frame(); lastFrame = Date.now(); gap = Math.max(40, 8 * (lastFrame - now)); } }
           break;
         }
         lambda *= 4;
       }
       if (!ok || stall >= 3) break;
-      if (opt.yield !== false && it % 3 === 2) await tick();
+      if (!opt.onPose && opt.yield !== false && it % 3 === 2) await tick();
     }
     return { M, cost: cur.cost, stats: cur };
   }
@@ -749,12 +751,13 @@ const OPT = (() => {
   const FINE = [
     { sigma: 0.5, maxR: 3, wp: 20, iters: 20, maxTr: 0.25, maxRot: 0.02 },
     { sigma: 0.25, maxR: 2, wp: 30, iters: 25, maxTr: 0.12, maxRot: 0.01 },
+    { sigma: 0.2, maxR: 1.5, wp: 80, iters: 20, maxTr: 0.05, maxRot: 0.005 },
   ];
   const SCORE = { sigma: 0.5, maxR: 3, wp: 20 };
 
   async function anneal(M, ctx, stages, opt = {}) {
     for (const st of stages) {
-      const r = await refine(M, ctx, st, st.iters, { maxTr: st.maxTr, maxRot: st.maxRot, cancel: opt.cancel, yield: opt.yield });
+      const r = await refine(M, ctx, st, st.iters, { maxTr: st.maxTr, maxRot: st.maxRot, cancel: opt.cancel, yield: opt.yield, onPose: opt.onPose });
       M = r.M;
     }
     return M;
@@ -844,13 +847,13 @@ const OPT = (() => {
   }
 
   /* Vizinhança da pose atual: os arquivos costumam sair do scanner já perto da mordida; perturbações pequenas cobrem erros de poucos mm/graus */
-  function localCandidates(M, center) {
+  function localCandidates(M, center, k = 1) {
     const out = [], Rm = (ax, deg) => { const w = [0, 0, 0]; w[ax] = deg * Math.PI / 180; return G.mat4FromRT(G.rodrigues(w[0], w[1], w[2]), [0, 0, 0]); };
     const T = (ax, mm) => { const t = [0, 0, 0]; t[ax] = mm; return G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], t); };
     const c = center || [0, 0, 0], toC = G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], c), fromC = G.mat4FromRT([1, 0, 0, 0, 1, 0, 0, 0, 1], [-c[0], -c[1], -c[2]]);
     for (let ax = 0; ax < 3; ax++) for (const s of [-1, 1]) {
-      out.push(G.mat4Mul(T(ax, s * 3), M));
-      out.push(G.mat4Mul(toC, G.mat4Mul(Rm(ax, s * 6), G.mat4Mul(fromC, M))));
+      out.push(G.mat4Mul(T(ax, s * 3 * k), M));
+      out.push(G.mat4Mul(toC, G.mat4Mul(Rm(ax, s * 6 * k), G.mat4Mul(fromC, M))));
     }
     return out;
   }
@@ -873,54 +876,66 @@ const OPT = (() => {
   /* busca em 4 etapas: (1) triagem rápida de ~21 poses iniciais, (2) recozimento das melhores,
      (3) "saltos" em torno da melhor (cobre erros de PCA de ~15°), (4) refinamento fino dos 3 melhores */
   async function autoOcclusion(up, lo, opt = {}) {
-    const rep = opt.onProgress || (() => { }), cancel = opt.cancel;
+    const rep = opt.onProgress || (() => { }), cancel = opt.cancel, emit = opt.onPose;
     const check = () => { if (cancel && cancel()) throw new Error("cancelado"); };
     const start = opt.start || G.mat4Identity();
     const ctxS = { up, lo, Ls: sampleVerts(lo, 450), Us: sampleVerts(up, 450) };
     const ctxF = { up, lo, Ls: sampleVerts(lo, 3500), Us: sampleVerts(up, 3500) };
     const ctxK = { up, lo, Ls: sampleVerts(lo, 6000), Us: sampleVerts(up, 6000) };
     const score = M => evaluate(M, ctxS, SCORE, false).cost;
+    let best = Infinity;
+    const show = (M, cost) => { if (emit && cost < best) { best = cost; emit(M); } };
 
-    const pool = [start, ...localCandidates(start, opt.center), ...globalCandidates(up, lo, 6)];
+    const pool = [start, ...localCandidates(start, opt.center), ...localCandidates(start, opt.center, 2.4), ...globalCandidates(up, lo, 10)];
     let cur = [];
     for (let i = 0; i < pool.length; i++) {
-      check(); rep(`Triagem ${i + 1} de ${pool.length}`, 0.02 + 0.2 * i / pool.length);
-      const M = await anneal(pool[i], ctxS, COARSE.slice(0, 1), { cancel, yield: true });
-      cur.push({ M, cost: score(M) });
+      check(); rep(`Testando posição ${i + 1} de ${pool.length}`, 0.02 + 0.2 * i / pool.length);
+      if (emit) emit(pool[i]);                       // animação: mostra o candidato e deixa-o assentar
+      const M = await anneal(pool[i], ctxS, COARSE.slice(0, 1), { cancel, yield: true, onPose: emit });
+      const cost = score(M); cur.push({ M, cost }); show(M, cost);
       await tick();
     }
     cur.sort((a, b) => a.cost - b.cost);
     cur = distinct(cur, 8, 1.0, 2);
     for (let i = 0; i < cur.length; i++) {
-      check(); rep(`Recozimento ${i + 1} de ${cur.length}`, 0.22 + 0.2 * i / cur.length);
+      check(); rep(`Ajustando contatos ${i + 1} de ${cur.length}`, 0.22 + 0.2 * i / cur.length);
       cur[i].M = await anneal(cur[i].M, ctxS, COARSE.slice(1), { cancel, yield: true });
-      cur[i].cost = score(cur[i].M);
+      cur[i].cost = score(cur[i].M); show(cur[i].M, cur[i].cost);
+      if (emit) await frame();
     }
     cur.sort((a, b) => a.cost - b.cost);
 
     for (let round = 0; round < 2; round++) {
-      const hops = localCandidates(cur[0].M, opt.center);
+      const hops = localCandidates(cur[0].M, opt.center, round ? 2.4 : 1);
       for (let i = 0; i < hops.length; i++) {
-        check(); rep(`Salto ${round + 1}: ${i + 1} de ${hops.length}`, 0.42 + 0.3 * (round * hops.length + i) / (2 * hops.length));
+        check(); rep(`Conferindo vizinhança ${round + 1}: ${i + 1} de ${hops.length}`, 0.42 + 0.3 * (round * hops.length + i) / (2 * hops.length));
         const M = await anneal(hops[i], ctxS, COARSE, { cancel, yield: true });
-        cur.push({ M, cost: score(M) });
-        await tick();
+        const cost = score(M); cur.push({ M, cost }); show(M, cost);
+        if (emit) await frame(); else await tick();
       }
       cur.sort((a, b) => a.cost - b.cost);
       cur = distinct(cur, 6, 1.0, 2);
     }
 
-    const picks = distinct(cur, 3, 1.5, 3), finals = [];
+    const picks = distinct(cur, 4, 1.5, 3), finals = [];
     for (let i = 0; i < picks.length; i++) {
-      check(); rep(`Refinando encaixe ${i + 1} de ${picks.length}`, 0.74 + 0.25 * i / picks.length);
-      const M = await anneal(picks[i].M, ctxF, FINE, { cancel, yield: true });
+      check(); rep(`Fechando a mordida ${i + 1} de ${picks.length}`, 0.74 + 0.25 * i / picks.length);
+      if (emit) emit(picks[i].M);
+      const M = await anneal(picks[i].M, ctxF, FINE, { cancel, yield: true, onPose: emit });
       const st = evaluate(M, ctxK, SCORE, false);
-      finals.push({ M, cost: st.cost, stats: st });
+      /* desempate: entre soluções de custo quase igual, vence a que tem mais pontos de contato simultâneos */
+      finals.push({ M, cost: st.cost, stats: st, key: st.cost - 0.1 * st.nNear / st.n });
     }
-    finals.sort((a, b) => a.cost - b.cost);
+    finals.sort((a, b) => a.key - b.key);
+    const f0 = finals[0];
+    let ambiguous = false;
+    for (const f of finals.slice(1)) {
+      const d = poseDiff(f0.M, f.M);
+      if (f.key - f0.key < 0.0008 && (d.t > 2 || d.a > 3)) { ambiguous = true; f.near = true; }
+    }
+    if (emit) emit(f0.M);
     rep("Concluído", 1);
-    const best = finals[0];
-    return { M: best.M, cost: best.cost, stats: best.stats, alternatives: finals };
+    return { M: f0.M, cost: f0.cost, stats: f0.stats, alternatives: finals, ambiguous };
   }
 
   function vertexDistances(src, M, dst, maxR, from, to, out) {
